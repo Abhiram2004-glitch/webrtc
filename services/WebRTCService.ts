@@ -18,6 +18,14 @@ class WebRTCService {
   private roomId: string = '';
   private userId: string = '';
   private isInitialized: boolean = false;
+  // Perfect-negotiation flags
+  private makingOffer: boolean = false;
+  private ignoreOffer: boolean = false;
+  private isPolite: boolean = false;
+  private socketId: string | null = null;
+  // Pre-created transceivers to stabilize m-line order
+  private audioTransceiver: any | null = null;
+  private videoTransceiver: any | null = null;
 
   // ICE servers configuration
   private configuration = {
@@ -123,6 +131,14 @@ class WebRTCService {
   private async initializePeerConnection(): Promise<void> {
     this.peerConnection = new RTCPeerConnection(this.configuration);
 
+    // Pre-create transceivers to lock m-line order (audio first, then video)
+    try {
+      this.audioTransceiver = (this.peerConnection as any).addTransceiver('audio', { direction: 'sendrecv' });
+      this.videoTransceiver = (this.peerConnection as any).addTransceiver('video', { direction: 'sendrecv' });
+    } catch (e) {
+      console.log('Transceiver creation not supported, continuing without pre-created transceivers');
+    }
+
     // Handle ICE candidates
     (this.peerConnection as any).onicecandidate = (event: any) => {
       if (event.candidate) {
@@ -134,6 +150,26 @@ class WebRTCService {
         });
       } else {
         console.log('ICE gathering completed');
+      }
+    };
+
+    // Gate offer creation to onnegotiationneeded using perfect-negotiation
+    (this.peerConnection as any).onnegotiationneeded = async () => {
+      try {
+        if (!this.peerConnection) return;
+        this.makingOffer = true;
+        const offer = await this.peerConnection.createOffer();
+        await this.peerConnection.setLocalDescription(offer);
+        this.socket?.emit('offer', {
+          roomId: this.roomId,
+          sdp: this.peerConnection.localDescription,
+          sender: this.userId,
+        });
+        console.log('Negotiationneeded: offer sent');
+      } catch (err) {
+        console.error('onnegotiationneeded error:', err);
+      } finally {
+        this.makingOffer = false;
       }
     };
 
@@ -213,11 +249,18 @@ class WebRTCService {
       console.log('Requesting media with constraints:', constraints);
       this.localStream = await mediaDevices.getUserMedia(constraints);
 
-      // Add media tracks to peer connection
+      // Attach media tracks via replaceTrack to avoid creating new m-lines
       if (this.peerConnection && this.localStream) {
         this.localStream.getTracks().forEach((track) => {
-          console.log(`Adding ${track.kind} track to peer connection`);
-          this.peerConnection?.addTrack(track, this.localStream!);
+          console.log(`Attaching ${track.kind} track via replaceTrack`);
+          if (track.kind === 'audio' && this.audioTransceiver) {
+            (this.audioTransceiver as any).sender.replaceTrack(track);
+          } else if (track.kind === 'video' && this.videoTransceiver) {
+            (this.videoTransceiver as any).sender.replaceTrack(track);
+          } else {
+            // Fallback if transceivers not available
+            this.peerConnection?.addTrack(track, this.localStream!);
+          }
         });
       }
 
@@ -239,7 +282,13 @@ class WebRTCService {
           
           if (this.peerConnection && this.localStream) {
             this.localStream.getTracks().forEach((track) => {
-              this.peerConnection?.addTrack(track, this.localStream!);
+              if (track.kind === 'audio' && this.audioTransceiver) {
+                (this.audioTransceiver as any).sender.replaceTrack(track);
+              } else if (track.kind === 'video' && this.videoTransceiver) {
+                (this.videoTransceiver as any).sender.replaceTrack(track);
+              } else {
+                this.peerConnection?.addTrack(track, this.localStream!);
+              }
             });
           }
           
@@ -270,9 +319,13 @@ class WebRTCService {
         return;
       }
 
-      // Check if we already have a remote description
-      if (this.peerConnection.remoteDescription) {
-        console.log('Remote description already set, ignoring duplicate offer');
+      // Perfect-negotiation role decision (stable ordering): polite = lexicographically higher userId
+      this.isPolite = !!this.userId && !!data.sender && String(this.userId) > String(data.sender);
+
+      const offerCollision = (this.makingOffer || (this.peerConnection.signalingState !== 'stable'));
+      this.ignoreOffer = !this.isPolite && offerCollision;
+      if (this.ignoreOffer) {
+        console.log('Offer collision detected and we are impolite; ignoring offer');
         return;
       }
 
@@ -283,13 +336,10 @@ class WebRTCService {
       }
 
       console.log('Setting remote description...');
-      await this.peerConnection.setRemoteDescription(
-        new RTCSessionDescription(data.sdp)
-      );
+      await this.peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
 
       console.log('Creating answer...');
       const answer = await this.peerConnection.createAnswer();
-      
       console.log('Setting local description...');
       await this.peerConnection.setLocalDescription(answer);
 
@@ -324,16 +374,14 @@ class WebRTCService {
         return;
       }
 
-      // Check if we already have a remote description
-      if (this.peerConnection.remoteDescription) {
-        console.log('Remote description already set, ignoring duplicate answer');
+      // If impolite and in collision, ignore
+      if (this.ignoreOffer) {
+        console.log('Ignoring answer due to previous ignored offer state');
         return;
       }
 
       console.log('Received answer, setting remote description...');
-      await this.peerConnection.setRemoteDescription(
-        new RTCSessionDescription(data.sdp)
-      );
+      await this.peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
       
       console.log('Answer processed successfully');
     } catch (error) {
@@ -355,9 +403,13 @@ class WebRTCService {
       }
 
       console.log('Adding ICE candidate...');
-      await this.peerConnection.addIceCandidate(
-        new RTCIceCandidate(data.candidate)
-      );
+      // Ignore candidates while we are ignoring an offer (collision)
+      if (this.ignoreOffer) {
+        console.log('Ignoring ICE candidate due to offer collision state');
+        return;
+      }
+
+      await this.peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
       console.log('ICE candidate added successfully');
     } catch (error) {
       console.error('Error handling ICE candidate:', error);
@@ -367,12 +419,7 @@ class WebRTCService {
   private handleRoomUpdate(data: any): void {
     const clients = data.clients || [];
     this.callbacks?.onRoomUpdate(clients);
-    
-    // If a new user joined and we're already in a call, establish connection
-    if (data.action === 'user-joined' && clients.length > 1) {
-      console.log('New user joined, establishing video connection...');
-      this.startVideoCall();
-    }
+    // Remove auto-offer trigger to prevent m-line reorder and glare
   }
 
   private handleChatMessage(data: ChatMessage): void {
@@ -382,12 +429,7 @@ class WebRTCService {
   private handleJoined(data: any): void {
     console.log('Successfully joined room:', data);
     this.callbacks?.onRoomUpdate(data.clients || []);
-    
-    // If there are other users in the room, automatically start video call
-    if (data.clients && data.clients.length > 1) {
-      console.log('Multiple users in room, starting video call...');
-      this.startVideoCall();
-    }
+    // Do not auto-start; rely on onnegotiationneeded
   }
 
   private handleIncomingCall(data: any): void {
