@@ -27,7 +27,23 @@ class WebRTCService {
       { urls: 'stun:stun2.l.google.com:19302' },
       { urls: 'stun:stun3.l.google.com:19302' },
       { urls: 'stun:stun4.l.google.com:19302' },
+      { urls: 'stun:stun.ekiga.net' },
+      { urls: 'stun:stun.ideasip.com' },
+      { urls: 'stun:stun.schlund.de' },
+      { urls: 'stun:stun.stunprotocol.org:3478' },
+      { urls: 'stun:stun.voiparound.com' },
+      { urls: 'stun:stun.voipbuster.com' },
+      { urls: 'stun:stun.voipstunt.com' },
+      { urls: 'stun:stun.counterpath.com' },
+      { urls: 'stun:stun.1und1.de' },
+      { urls: 'stun:stun.gmx.net' },
+      { urls: 'stun:stun.voipbuster.com' },
+      { urls: 'stun:stun.voipstunt.com' },
+      { urls: 'stun:stun.voiparound.com' },
+      { urls: 'stun:stun.voipbuster.com' },
+      { urls: 'stun:stun.voipstunt.com' },
     ],
+    iceCandidatePoolSize: 10,
   };
 
   async initialize(
@@ -180,25 +196,62 @@ class WebRTCService {
 
   async startLocalStream(video: boolean = true, audio: boolean = true): Promise<void> {
     try {
-      const constraints = {
-        video: video ? true : false,
-        audio: audio,
+      const constraints: any = {
+        video: video ? {
+          width: { min: 320, ideal: 640, max: 1280 },
+          height: { min: 240, ideal: 480, max: 720 },
+          frameRate: { min: 15, ideal: 30, max: 30 },
+          facingMode: 'user',
+        } : false,
+        audio: audio ? {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        } : false,
       };
 
+      console.log('Requesting media with constraints:', constraints);
       this.localStream = await mediaDevices.getUserMedia(constraints);
 
       // Add media tracks to peer connection
       if (this.peerConnection && this.localStream) {
         this.localStream.getTracks().forEach((track) => {
+          console.log(`Adding ${track.kind} track to peer connection`);
           this.peerConnection?.addTrack(track, this.localStream!);
         });
       }
 
       this.callbacks?.onLocalStream(this.localStream);
-      console.log('Local stream started');
+      console.log('Local stream started successfully');
     } catch (error) {
       console.error('Failed to start local stream:', error);
-      throw error;
+      
+      // Try with simpler constraints if the first attempt fails
+      if (video || audio) {
+        console.log('Retrying with simpler constraints...');
+        try {
+          const simpleConstraints = {
+            video: video ? true : false,
+            audio: audio ? true : false,
+          };
+          
+          this.localStream = await mediaDevices.getUserMedia(simpleConstraints);
+          
+          if (this.peerConnection && this.localStream) {
+            this.localStream.getTracks().forEach((track) => {
+              this.peerConnection?.addTrack(track, this.localStream!);
+            });
+          }
+          
+          this.callbacks?.onLocalStream(this.localStream);
+          console.log('Local stream started with simple constraints');
+        } catch (retryError) {
+          console.error('Failed to start local stream with simple constraints:', retryError);
+          throw retryError;
+        }
+      } else {
+        throw error;
+      }
     }
   }
 
@@ -209,12 +262,35 @@ class WebRTCService {
         return;
       }
 
-      console.log('Received offer, creating answer...');
+      console.log('Received offer, validating SDP...');
+      
+      // Validate SDP data
+      if (!data.sdp || !data.sdp.type || !data.sdp.sdp) {
+        console.error('Invalid SDP data received:', data);
+        return;
+      }
+
+      // Check if we already have a remote description
+      if (this.peerConnection.remoteDescription) {
+        console.log('Remote description already set, ignoring duplicate offer');
+        return;
+      }
+
+      // Ensure local stream is ready before setting remote description
+      if (!this.localStream) {
+        console.log('Local stream not ready, starting it first...');
+        await this.startLocalStream(true, true);
+      }
+
+      console.log('Setting remote description...');
       await this.peerConnection.setRemoteDescription(
         new RTCSessionDescription(data.sdp)
       );
 
+      console.log('Creating answer...');
       const answer = await this.peerConnection.createAnswer();
+      
+      console.log('Setting local description...');
       await this.peerConnection.setLocalDescription(answer);
 
       this.socket?.emit('answer', {
@@ -226,6 +302,12 @@ class WebRTCService {
       console.log('Answer sent successfully');
     } catch (error) {
       console.error('Error handling offer:', error);
+      
+      // Try to recover by recreating the peer connection
+      if ((error as Error).message.includes('error_content') || (error as Error).message.includes('InvalidStateError')) {
+        console.log('Attempting to recover from SDP error...');
+        await this.recoverFromSDPError();
+      }
     }
   }
 
@@ -233,6 +315,18 @@ class WebRTCService {
     try {
       if (!this.peerConnection) {
         console.log('Peer connection not ready for answer');
+        return;
+      }
+
+      // Validate SDP data
+      if (!data.sdp || !data.sdp.type || !data.sdp.sdp) {
+        console.error('Invalid SDP data received:', data);
+        return;
+      }
+
+      // Check if we already have a remote description
+      if (this.peerConnection.remoteDescription) {
+        console.log('Remote description already set, ignoring duplicate answer');
         return;
       }
 
@@ -244,6 +338,12 @@ class WebRTCService {
       console.log('Answer processed successfully');
     } catch (error) {
       console.error('Error handling answer:', error);
+      
+      // Try to recover from SDP error
+      if ((error as Error).message.includes('error_content') || (error as Error).message.includes('InvalidStateError')) {
+        console.log('Attempting to recover from SDP error...');
+        await this.recoverFromSDPError();
+      }
     }
   }
 
@@ -323,9 +423,25 @@ class WebRTCService {
 
   async createOffer(): Promise<void> {
     try {
-      if (!this.peerConnection) return;
+      if (!this.peerConnection) {
+        console.log('Peer connection not ready for offer creation');
+        return;
+      }
 
-      const offer = await this.peerConnection.createOffer();
+      // Ensure local stream is ready
+      if (!this.localStream) {
+        console.log('Local stream not ready, starting it first...');
+        await this.startLocalStream(true, true);
+      }
+
+      console.log('Creating offer with proper constraints...');
+      const offer = await this.peerConnection.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: true,
+        voiceActivityDetection: true,
+      });
+      
+      console.log('Setting local description...');
       await this.peerConnection.setLocalDescription(offer);
 
       this.socket?.emit('offer', {
@@ -333,9 +449,36 @@ class WebRTCService {
         sdp: offer,
         sender: this.userId,
       });
+      
+      console.log('Offer sent successfully');
     } catch (error) {
       console.error('Error creating offer:', error);
       throw error;
+    }
+  }
+
+  private async recoverFromSDPError(): Promise<void> {
+    try {
+      console.log('Recovering from SDP error by recreating peer connection...');
+      
+      // Close existing peer connection
+      if (this.peerConnection) {
+        this.peerConnection.close();
+      }
+      
+      // Reinitialize peer connection
+      await this.initializePeerConnection();
+      
+      // Re-add local stream if available
+      if (this.localStream) {
+        this.localStream.getTracks().forEach((track) => {
+          this.peerConnection?.addTrack(track, this.localStream!);
+        });
+      }
+      
+      console.log('Peer connection recovery completed');
+    } catch (error) {
+      console.error('Error during SDP recovery:', error);
     }
   }
 
